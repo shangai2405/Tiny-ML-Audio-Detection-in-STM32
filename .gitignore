@@ -1,0 +1,11 @@
+# Build outputs
+Debug/
+Release/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary / editor files
+*.swp
+*~
