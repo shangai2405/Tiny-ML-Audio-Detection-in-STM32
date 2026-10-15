@@ -3,13 +3,19 @@
 export_nn.py - turn model/ds_cnn_s_int8.tflite (ARM ML-KWS-for-MCU DS-CNN-S, int8 PTQ)
 into plain C tables for Core/Src/kws_nn_data.c, so the STM32 needs NO X-CUBE-AI.
 
-Usage:  python3 tools/export_nn.py            (run from the project root)
+Usage:  python3 tools/export_nn.py [path/to/model.tflite]   (default: model/ds_cnn_s_int8.tflite)
+        If you pass a model (e.g. one trained with tools/train/kws_train.py) it is copied to
+        model/ds_cnn_s_int8.tflite and the input/output quantisation constants in
+        Core/Inc/kws_model_params.h and model/model_params.json are updated to match it.
 Needs:  pip install ai-edge-litert numpy
 
 The script asserts the exact op sequence / shapes the C engine (kws_nn.c) implements,
 so it fails loudly if the .tflite is swapped for a different architecture.
 """
+import json
 import math
+import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -19,6 +25,12 @@ from ai_edge_litert.interpreter import Interpreter
 ROOT = Path(__file__).resolve().parent.parent
 MODEL = ROOT / "model" / "ds_cnn_s_int8.tflite"
 OUT = ROOT / "Core" / "Src" / "kws_nn_data.c"
+PARAMS_H = ROOT / "Core" / "Inc" / "kws_model_params.h"
+PARAMS_JSON = ROOT / "model" / "model_params.json"
+if len(sys.argv) > 1:
+    SRC = Path(sys.argv[1]).resolve()
+    if SRC != MODEL.resolve():
+        shutil.copyfile(SRC, MODEL)
 
 
 def quantize_multiplier(real):
@@ -38,11 +50,14 @@ def quantize_multiplier(real):
 it = Interpreter(model_path=str(MODEL))
 it.allocate_tensors()
 T = {t["index"]: t for t in it.get_tensor_details()}
-ops = [o for o in it._get_ops_details() if o["op_name"] != "DELEGATE"]
+# RESHAPE ops only change the tensor view (49x10 -> 49x10x1 at the input, 1x1x64 -> 64 before the FC);
+# the C engine's data layout is identical, so they are ignored.
+ops = [o for o in it._get_ops_details() if o["op_name"] not in ("DELEGATE", "RESHAPE")]
 names = [o["op_name"] for o in ops]
-expect = (["RESHAPE", "CONV_2D"] + ["DEPTHWISE_CONV_2D", "CONV_2D"] * 4 +
+expect = (["CONV_2D"] + ["DEPTHWISE_CONV_2D", "CONV_2D"] * 4 +
           ["AVERAGE_POOL_2D", "FULLY_CONNECTED", "SOFTMAX"])
 assert names == expect, f"unexpected graph: {names}"
+assert list(T[ops[9]["inputs"][0]]["shape"]) == [1, 25, 5, 64], "avg-pool input must be 1x25x5x64"
 
 
 def tensor(i):
@@ -64,26 +79,28 @@ def layer(op, kind):
     W = tensor(w).astype(np.int8)
     B = tensor(b).astype(np.int64)
     n = W.shape[0] if kind != "dw" else W.shape[3]
-    assert len(s_w) == n and np.all(_ == 0), "weights must be symmetric per-channel"
+    if len(s_w) == 1:                       # some converters quantise the FC weights per tensor
+        s_w = np.repeat(s_w, n)
+    assert len(s_w) == n and np.all(_ == 0), "weights must be symmetric (zero point 0)"
     mult, shift = zip(*[quantize_multiplier(float(s_in[0] * s_w[c] / s_out[0])) for c in range(n)])
     return dict(W=W, B=B, mult=np.array(mult, np.int64), shift=np.array(shift, np.int64),
                 zp_in=int(zp_in[0]), zp_out=int(zp_out[0]), n=n)
 
 
-conv1 = layer(ops[1], "conv")
-assert conv1["W"].shape == (64, 10, 4, 1) and conv1["zp_in"] == 37
+conv1 = layer(ops[0], "conv")
+assert conv1["W"].shape == (64, 10, 4, 1)
 dws, pws = [], []
 for k in range(4):
-    dw = layer(ops[2 + 2 * k], "dw")
-    pw = layer(ops[3 + 2 * k], "conv")
+    dw = layer(ops[1 + 2 * k], "dw")
+    pw = layer(ops[2 + 2 * k], "conv")
     assert dw["W"].shape == (1, 3, 3, 64) and pw["W"].shape == (64, 1, 1, 64)
     dws.append(dw)
     pws.append(pw)
-fc = layer(ops[11], "fc")
+fc = layer(ops[10], "fc")
 assert fc["W"].shape == (12, 64)
-sm_in_scale = float(qp(ops[12]["inputs"][0])[0][0])
-sm_in_zp = int(qp(ops[12]["inputs"][0])[1][0])
-pool_zp = int(qp(ops[10]["outputs"][0])[1][0])
+sm_in_scale = float(qp(ops[11]["inputs"][0])[0][0])
+sm_in_zp = int(qp(ops[11]["inputs"][0])[1][0])
+pool_zp = int(qp(ops[9]["outputs"][0])[1][0])
 assert pool_zp == fc["zp_in"] and pool_zp == pws[3]["zp_out"]
 
 lines = []
@@ -173,3 +190,18 @@ OUT.write_text("\n".join(lines) + "\n")
 
 n_w = conv1["W"].size + sum(d["W"].size + p["W"].size for d, p in zip(dws, pws)) + fc["W"].size
 print(f"wrote {OUT}  ({OUT.stat().st_size} bytes of source, {n_w} int8 weights)")
+
+# ---- keep the firmware's input/output quantisation constants in sync with the model ----
+in_q = it.get_input_details()[0]["quantization"]
+out_q = it.get_output_details()[0]["quantization"]
+assert abs(out_q[0] - 1 / 256) < 1e-9 and out_q[1] == -128, f"softmax output must be 1/256, zp -128 (got {out_q})"
+assert list(it.get_input_details()[0]["shape"]) == [1, 490]
+h = PARAMS_H.read_text()
+h2 = re.sub(r"(#define\s+KWS_IN_SCALE\s+)\(.*?\)", lambda m: f"{m.group(1)}({in_q[0]:.9e}f)", h)
+h2 = re.sub(r"(#define\s+KWS_IN_ZERO_POINT\s+)\(.*?\)", lambda m: f"{m.group(1)}({int(in_q[1])})", h2)
+if h2 != h:
+    PARAMS_H.write_text(h2)
+pj = json.loads(PARAMS_JSON.read_text())
+pj["input_scale"], pj["input_zero_point"] = float(in_q[0]), int(in_q[1])
+PARAMS_JSON.write_text(json.dumps(pj, indent=1))
+print(f"input quantisation: scale={in_q[0]:.9g} zp={int(in_q[1])}  (written to kws_model_params.h / model_params.json)")

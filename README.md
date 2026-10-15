@@ -1,7 +1,7 @@
-# KWS_F401 – "ON" / "OFF" / UNKNOWN keyword spotter (STM32F401 Black Pill)
+# KWS_F401 – "GO" / "STOP" keyword spotter (STM32F401 Black Pill)
 
 Pretrained **ARM ML-KWS-for-MCU DS-CNN-S** (int8) running fully on the F401 with a self-contained C engine.
-No X-CUBE-AI, no CMSIS-NN, no malloc. The OLED shows ON / OFF / UNKNOWN; LED PC13 follows ON/OFF.
+No X-CUBE-AI, no CMSIS-NN, no malloc. The OLED shows GO / STOP / UNKNOWN (confidence frozen at its peak for 2 s). LED PC13: GO = on, STOP = off.
 
 ## Wiring
 | Part | Pins |
@@ -20,8 +20,10 @@ The clock is **84 MHz** (HSI -> PLL), not 16 MHz: inference at 16 MHz would take
 used by the firmware (CubeMX regeneration is safe, but keep the USER CODE lines in main.c).
 
 ## Using it
-Say "on" / "off" clearly ~20-50 cm from the mic. Debug line over UART every 2 s:
-`on=.. off=.. unk=.. sil=.. peak=.. ch=.. inf=..ms ovr=.. err=..`
+The microphone is **off** unless you **hold the PA0 button** (the onboard KEY button): hold it, say go or stop, release. It keeps listening ~0.7 s after release so the last word is still decided. The first decision needs ~0.5 s of audio, so start speaking right when you press.
+
+Say "go" or "stop" clearly ~20-50 cm from the mic. Debug line over UART every 2 s:
+`go=.. stop=.. unk=.. sil=.. peak=.. ch=.. inf=..ms ovr=.. err=..`
 - `inf` inference time (expect ~160 ms), `ovr` count of missed windows (should stay 0 or tiny)
 - `peak` mic level: if always tiny, raise `KWS_MIC_GAIN_SHIFT`; if ~full-scale, lower it
 - `err` I2S errors. Boot line prints CPU MHz and the real sample rate (should be 16000).
@@ -35,5 +37,5 @@ Tunables are in `Core/Inc/kws_app.h` (gain shift, probability threshold, consecu
 
 ## Known limits
 Engine is bit-exact with TFLite on all conv layers; final FC differs by 1 LSB on ~0.2% of values.
-Reference accuracy of this model on Speech Commands v2 (4590 clips): 89% 12-class; ON 86% / OFF 88% recall at p>=0.8, ~0.3% false trigger.
+Reference accuracy of this model on Speech Commands v2 (4590 clips): 89% 12-class; about 0.3% false triggers (measured earlier for ON/OFF; GO/STOP not measured separately).
 Real-world accuracy with an INMP441 will vary with room noise and distance.

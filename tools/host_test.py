@@ -31,7 +31,9 @@ it = Interpreter(model_path=str(ROOT / "model" / "ds_cnn_s_int8.tflite"),
                  experimental_preserve_all_tensors=True)
 it.allocate_tensors()
 inp = it.get_input_details()[0]["index"]
-LAYER_T = [23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34]     # tensor index of each C debug layer
+_ops = [o for o in it._get_ops_details() if o["op_name"] not in ("DELEGATE", "RESHAPE")]
+# output tensor of: conv1, (dw, pw) x4, [avg pool skipped], fc, softmax
+LAYER_T = [_ops[i]["outputs"][0] for i in list(range(0, 9)) + [10, 11]]     # tensor index of each C debug layer
 NAMES = ["conv1", "dw1", "pw1", "dw2", "pw2", "dw3", "pw3", "dw4", "pw4", "fc logits", "probs"]
 SIZES = [8000] * 9 + [12, 12]
 
